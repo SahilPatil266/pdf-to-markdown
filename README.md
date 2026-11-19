@@ -7,7 +7,7 @@ Format-agnostic: every rule is about layout (font size, weight, alignment, gaps,
 Handles headings, paragraphs, bold/italic, bullet and numbered lists, ruled tables, borderless tables, tables continued across pages, key/value rows, checkboxes, address blocks, code blocks, repeated headers/footers and page numbers, and two-column pages.
 
 ```bash
-pip install pymupdf
+pip install -r requirements.txt
 python pdf_to_markdown.py input.pdf                # writes input.md
 python pdf_to_markdown.py input.pdf -o out.md --pages 1-5 --page-breaks
 python pdf_to_markdown.py pdfs/ -o md/             # whole folder
