@@ -2,14 +2,16 @@
 """
 pdf_to_markdown.py - Deterministically convert the text of a PDF into clean, readable Markdown.
 
-No AI involved: the same PDF always gives the same Markdown. Images are ignored.
+No AI or ML involved (PyMuPDF's optional layout model and table finder are not used), so the
+same PDF always gives the same Markdown on any machine. Images are ignored. Typically < 0.1 s per page.
 
 What it handles
   * Headings         font size relative to body text (#, ##, ###); short bold lines -> ####
   * Paragraphs       wrapped lines joined, hyphenated line breaks repaired
   * Bold / italic    preserved inline
   * Lists            bullets (•, -, ▪ ...) and numbering (1. / 1) / a) / i.)
-  * Ruled tables     tables drawn with lines (PyMuPDF), including rows that are not separated by rules
+  * Ruled tables     grids detected from the drawn lines, including rows not separated by rules
+  * Checkboxes       drawn boxes become [x] / [ ]
   * Borderless tables  rows of text aligned in 3+ columns (invoices, statements, reports)
   * Key/value pairs  "Label ..... value" rows (totals, invoice details, form fields) -> bullet list
   * Short-line blocks  addresses / contact blocks keep their line breaks
@@ -33,10 +35,13 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import unicodedata
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+warnings.filterwarnings("ignore")
 try:
     import pymupdf  # PyMuPDF >= 1.24
 except ImportError:
@@ -65,6 +70,7 @@ VALUE_RE = re.compile(
     re.I,
 )
 
+NUM_TOKEN_RE = re.compile(r"^[-+(]?[$£€₹¥]?\d[\d.,]*%?\)?$")
 FLAG_ITALIC, FLAG_MONO, FLAG_BOLD = 2, 8, 16
 
 
@@ -86,6 +92,7 @@ class Frag:
     y1: float
     bid: int = 0   # source block id
     base: float = 0.0  # baseline y
+    words: list = field(default_factory=list)  # [(x0, x1, word)] for re-splitting cells
 
 
 @dataclass
@@ -136,7 +143,14 @@ _REPL = {" ": " ", " ": " ", " ": " ", " ": " ", "​": "", "\t": " ",
 def clean(text: str) -> str:
     for k, v in _REPL.items():
         text = text.replace(k, v)
-    return text
+    # unmapped glyphs (control / private-use codes) are almost always symbol-font bullets
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if cat == "Cs" or ch == "\ufffd":        # broken / unmappable code points
+            continue
+        out.append("•" if cat in ("Cc", "Co") and ch != "\n" else ch)
+    return "".join(out)
 
 
 def escape_md(text: str) -> str:
@@ -162,6 +176,15 @@ def parse_page_ranges(spec: str, n: int) -> list[int]:
 def col_gap(size: float) -> float:
     """Horizontal gap that separates two cells/columns rather than two words."""
     return max(1.5 * size, 9)
+
+
+def is_cell_break(left: str, right: str, gap: float, size: float) -> bool:
+    """Is the gap between two pieces of text a column boundary rather than a word space?"""
+    if gap > col_gap(size):
+        return True
+    lw, rw = left.strip().split()[-1:] or [""], right.strip().split()[:1] or [""]
+    # two numbers side by side need far less space to be separate columns
+    return gap > 0.6 * size and bool(NUM_TOKEN_RE.match(lw[0])) and bool(NUM_TOKEN_RE.match(rw[0]))
 
 
 def inside(x: float, y: float, r: tuple) -> bool:
@@ -214,21 +237,64 @@ def make_frag(spans: list[dict], bid: int) -> Frag | None:
         text = re.sub(r"\s+", " ", "".join(out)).strip()
         text = re.sub(r"\*\*\s+\*\*", " ", text)
     base = Counter(round(s["origin"][1], 1) for s in spans).most_common(1)[0][0] if "origin" in spans[0] else y1
-    return Frag(text, plain, size, all_b, all_i, all_m, x0, y0, x1, y1, bid, base)
+    words = []
+    for s in spans:                                   # approximate word boxes inside each span
+        t = clean(s["text"]); sx0, sx1 = s["bbox"][0], s["bbox"][2]
+        if not t.strip():
+            continue
+        cw = (sx1 - sx0) / max(len(t), 1)
+        for m in re.finditer(r"\S+", t):
+            words.append((sx0 + m.start() * cw, sx0 + m.end() * cw, m.group()))
+    return Frag(text, plain, size, all_b, all_i, all_m, x0, y0, x1, y1, bid, base, words)
+
+
+def explode_span(s: dict) -> list[dict]:
+    """rawdict span -> word-level pieces with exact boxes (spaces kept as their own pieces)."""
+    chars = s.get("chars")
+    if chars is None:                       # plain "dict" span
+        return [s]
+    out, cur = [], []
+
+    def emit(group):
+        if not group:
+            return
+        t = "".join(c["c"] for c in group)
+        x0 = group[0]["bbox"][0]; x1 = group[-1]["bbox"][2]
+        y0 = min(c["bbox"][1] for c in group); y1 = max(c["bbox"][3] for c in group)
+        out.append({**{k: v for k, v in s.items() if k != "chars"}, "text": t, "bbox": (x0, y0, x1, y1),
+                    "origin": group[0].get("origin", s.get("origin"))})
+
+    for c in chars:
+        sp = c["c"].isspace()
+        if cur and sp != cur[-1]["c"].isspace():
+            emit(cur); cur = []
+        cur.append(c)
+    emit(cur)
+    return out
 
 
 def split_line_into_frags(ln: dict, bid: int) -> list[Frag]:
     """Split a PyMuPDF line wherever there is a wide horizontal gap (column / tab stop)."""
-    spans = [s for s in ln.get("spans", []) if s["text"].strip()]
+    spans = [p for s in ln.get("spans", []) for p in explode_span(s) if p["text"]]
+    while spans and not spans[0]["text"].strip():
+        spans.pop(0)
     if not spans:
         return []
     groups, cur = [], [spans[0]]
+    last_ink = spans[0]                       # last span that has visible characters
     for s in spans[1:]:
-        gap = s["bbox"][0] - cur[-1]["bbox"][2]
-        if gap > col_gap(s["size"]):
+        if not s["text"].strip():             # word spaces are often separate spans: keep them
+            cur.append(s)
+            continue
+        gap = s["bbox"][0] - last_ink["bbox"][2]
+        if is_cell_break(last_ink["text"], s["text"], gap, s["size"]):
             groups.append(cur); cur = [s]
         else:
+            if gap > 0.15 * s["size"] and not cur[-1]["text"][-1:].isspace() \
+                    and not s["text"][:1].isspace():
+                cur.append({**s, "text": " "})   # visible gap but no space char: insert one
             cur.append(s)
+        last_ink = s
     groups.append(cur)
     return [f for f in (make_frag(g, bid) for g in groups) if f]
 
@@ -239,29 +305,9 @@ def split_line_into_frags(ln: dict, bid: int) -> list[Frag]:
 def extract_page(page, page_no: int, use_tables: bool) -> list[Block]:
     pw = page.rect.width
     blocks: list[Block] = []
-    table_rects: list[tuple] = []
 
-    # 1) tables that are drawn with ruling lines
-    if use_tables and hasattr(page, "find_tables"):
-        try:
-            found = page.find_tables(strategy="lines_strict").tables
-        except Exception:
-            try:
-                found = page.find_tables().tables
-            except Exception:
-                found = []
-        verticals = vertical_rules(page)
-        for tab in found:
-            if not has_inner_rule(tab.bbox, verticals):   # alignment-only guess: use our own grid logic
-                continue
-            md = ruled_table_to_markdown(tab, page)
-            if md:
-                r = tuple(tab.bbox)
-                table_rects.append(r)
-                blocks.append(Block("table", table_md=md, y0=r[1], x0=r[0], page=page_no))
-
-    # 2) text -> fragments grouped per source block
-    data = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE | pymupdf.TEXT_MEDIABOX_CLIP)
+    # 1) text -> fragments grouped per source block
+    data = page.get_text("rawdict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE | pymupdf.TEXT_MEDIABOX_CLIP)
     raw: dict[int, list[Frag]] = {}
     for bid, b in enumerate(data.get("blocks", [])):
         if b.get("type") != 0:
@@ -271,11 +317,24 @@ def extract_page(page, page_no: int, use_tables: bool) -> list[Block]:
             if abs(dy) > 0.1:                       # rotated / vertical text
                 continue
             for f in split_line_into_frags(ln, bid):
-                cx, cy = (f.x0 + f.x1) / 2, (f.y0 + f.y1) / 2
-                if any(inside(cx, cy, r) for r in table_rects):
-                    continue
                 raw.setdefault(bid, []).append(f)
 
+    # 2) tables drawn with ruling lines (detected from the vector drawings, no ML involved)
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+    if use_tables:
+        for grid in find_grids(drawings):
+            md, used = grid_table(grid, raw)
+            if md:
+                gx0, gy0 = grid[0][0], grid[1][0]
+                blocks.append(Block("table", table_md=md, y0=gy0, x0=gx0, page=page_no))
+                for f in used:
+                    raw[f.bid].remove(f)
+        raw = {k: v for k, v in raw.items() if v}
+
+    mark_checkboxes(drawings, raw)
     two_col = is_two_column(raw, pw)
 
     # 3) union blocks that share baselines (cells of the same row living in different blocks)
@@ -326,7 +385,7 @@ def frags_to_lines(frags: list[Frag], page_no: int, pw: float) -> list[Line]:
         merged = [r[0]]
         for f in r[1:]:
             p = merged[-1]
-            if f.x0 - p.x1 <= col_gap(f.size):
+            if not is_cell_break(p.plain, f.plain, f.x0 - p.x1, f.size):
                 mk = MARKER_ONLY_RE.match(p.plain)
                 if mk and len(p.plain) <= 4:          # stand-alone bullet / number glyph
                     num = mk.group(2)
@@ -335,7 +394,8 @@ def frags_to_lines(frags: list[Frag], page_no: int, pw: float) -> list[Line]:
                 main_size = p.size if len(p.plain) >= len(f.plain) else f.size
                 merged[-1] = Frag(p.text + " " + f.text, p.plain + " " + f.plain, main_size,
                                   p.bold and f.bold, p.italic and f.italic, p.mono and f.mono,
-                                  p.x0, min(p.y0, f.y0), f.x1, max(p.y1, f.y1), p.bid, p.base)
+                                  p.x0, min(p.y0, f.y0), f.x1, max(p.y1, f.y1), p.bid, p.base,
+                                  p.words + f.words)
             else:
                 merged.append(f)
         lines.append(Line(merged, page_no, pw))
@@ -357,22 +417,49 @@ def attach_list_markers(lines: list[Line]) -> None:
             del l.cells[0]
 
 
+CHECK_GLYPHS = {"x", "X", "✓", "✔", "✗", "✘", "■", "●", "•"}
+
+
+def mark_checkboxes(drawings, raw: dict[int, list[Frag]]) -> None:
+    """Small drawn squares followed by a label become '[x] label' / '[ ] label'."""
+    boxes = [it[1] for d in drawings for it in d.get("items", [])
+             if it[0] == "re" and 5 <= it[1].width <= 16 and abs(it[1].width - it[1].height) < 2]
+    if not boxes:
+        return
+    frags = [f for fs in raw.values() for f in fs]
+    for r in boxes:
+        checked = False
+        for f in list(frags):                       # a tick / cross drawn inside the box
+            if f.plain in CHECK_GLYPHS and r.x0 - 2 <= (f.x0 + f.x1) / 2 <= r.x1 + 2 \
+                    and r.y0 - 2 <= (f.y0 + f.y1) / 2 <= r.y1 + 2:
+                checked = True
+                raw[f.bid].remove(f); frags.remove(f)
+        label = min((f for f in frags if 0 <= f.x0 - r.x1 < 20 and f.y0 - 3 <= (r.y0 + r.y1) / 2 <= f.y1 + 3),
+                    key=lambda f: f.x0 - r.x1, default=None)
+        if label:
+            box = "[x] " if checked else "[ ] "
+            label.text, label.plain = "• " + box + label.text, "• " + box + label.plain
+            label.x0 = r.x0
+
+
 def is_two_column(raw: dict[int, list[Frag]], pw: float) -> bool:
     """True only for real two-column prose (papers, newsletters), not forms or invoices."""
     mid = pw / 2
-    left = right = total = 0
+    left = right = across = total = 0
     for fs in raw.values():
         x0, x1 = min(f.x0 for f in fs), max(f.x1 for f in fs)
         chars = sum(len(f.plain) for f in fs)
         avg = chars / max(len(fs), 1)
         total += chars
-        if avg < 35:                     # short lines are not prose
+        if avg < 25:                     # labels, numbers, table cells: not prose
             continue
         if x1 < mid + 10:
             left += chars
         elif x0 > mid - 10:
             right += chars
-    return total > 0 and left / total > 0.3 and right / total > 0.3
+        else:
+            across += chars
+    return total > 0 and left > 0.15 * total and right > 0.15 * total and across < left + right
 
 
 def order_blocks(blocks: list[Block], pw: float, two_col: bool) -> list[Block]:
@@ -409,65 +496,129 @@ def md_table(rows: list[list[str]]) -> str:
     return "\n".join(out)
 
 
-def vertical_rules(page) -> list[tuple[float, float, float]]:
-    """Vertical line segments drawn on the page as (x, y_top, y_bottom)."""
-    segs = []
-    try:
-        drawings = page.get_drawings()
-    except Exception:
-        return segs
+def rule_segments(drawings) -> tuple[list, list]:
+    """Horizontal (y, x0, x1) and vertical (x, y0, y1) rules from the page's vector drawings."""
+    hs, vs = [], []
     for d in drawings:
+        stroked = "s" in (d.get("type") or "s")
         for it in d.get("items", []):
             if it[0] == "l":
                 a, b = it[1], it[2]
-                if abs(a.x - b.x) < 1.5 and abs(a.y - b.y) > 4:
-                    segs.append((a.x, min(a.y, b.y), max(a.y, b.y)))
+                if abs(a.y - b.y) < 1.5 and abs(a.x - b.x) > 4:
+                    hs.append(((a.y + b.y) / 2, min(a.x, b.x), max(a.x, b.x)))
+                elif abs(a.x - b.x) < 1.5 and abs(a.y - b.y) > 4:
+                    vs.append(((a.x + b.x) / 2, min(a.y, b.y), max(a.y, b.y)))
             elif it[0] == "re":
                 r = it[1]
-                if r.width < 3 and r.height > 4:           # hairline drawn as a thin rectangle
-                    segs.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
-                elif r.width >= 3 and r.height > 4:
-                    segs += [(r.x0, r.y0, r.y1), (r.x1, r.y0, r.y1)]
-    return segs
+                if r.height < 3 and r.width > 4:                    # hairline as thin rectangle
+                    hs.append(((r.y0 + r.y1) / 2, r.x0, r.x1))
+                elif r.width < 3 and r.height > 4:
+                    vs.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
+                elif stroked and r.width > 16 and r.height > 8:     # outlined box (not a checkbox)
+                    hs += [(r.y0, r.x0, r.x1), (r.y1, r.x0, r.x1)]
+                    vs += [(r.x0, r.y0, r.y1), (r.x1, r.y0, r.y1)]
+    return hs, vs
 
 
-def has_inner_rule(bbox, segs) -> bool:
-    x0, y0, x1, y1 = bbox
-    h = max(y1 - y0, 1)
-    for x, a, b in segs:
-        if x0 + 5 < x < x1 - 5 and min(b, y1) - max(a, y0) >= 0.4 * h:
-            return True
-    return False
+def find_grids(drawings) -> list[tuple[list[float], list[float]]]:
+    """Connected sets of crossing rules that form a table with at least one inner column rule.
+    Returns (column boundaries xs, row boundaries ys) for each grid."""
+    hs, vs = rule_segments(drawings)
+    if not hs or not vs:
+        return []
+    n = len(hs) + len(vs)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]; a = parent[a]
+        return a
+
+    tol = 2.5
+    for i, (y, hx0, hx1) in enumerate(hs):
+        for j, (x, vy0, vy1) in enumerate(vs):
+            if hx0 - tol <= x <= hx1 + tol and vy0 - tol <= y <= vy1 + tol:
+                parent[find(i)] = find(len(hs) + j)
+    comps: dict[int, tuple[list, list]] = {}
+    for i, h in enumerate(hs):
+        comps.setdefault(find(i), ([], []))[0].append(h)
+    for j, v in enumerate(vs):
+        comps.setdefault(find(len(hs) + j), ([], []))[1].append(v)
+
+    def uniq(vals):
+        out = []
+        for v in sorted(vals):
+            if not out or v - out[-1] > 2:
+                out.append(v)
+        return out
+
+    grids = []
+    for chs, cvs in comps.values():
+        if not chs or not cvs:
+            continue
+        x0 = min(min(h[1] for h in chs), min(v[0] for v in cvs))
+        x1 = max(max(h[2] for h in chs), max(v[0] for v in cvs))
+        y0 = min(min(h[0] for h in chs), min(v[1] for v in cvs))
+        y1 = max(max(h[0] for h in chs), max(v[2] for v in cvs))
+        if x1 - x0 < 30 or y1 - y0 < 10:
+            continue
+        inner = [v for v in cvs if x0 + 5 < v[0] < x1 - 5 and v[2] - v[1] >= 0.4 * (y1 - y0)]
+        if not inner:                     # a box or underlines, not a table
+            continue
+        xs = uniq([x0, x1] + [v[0] for v in inner])
+        ys = uniq([y0, y1] + [h[0] for h in chs if h[2] - h[1] >= 0.4 * (x1 - x0)])
+        grids.append((xs, ys))
+    return grids
 
 
-def ruled_table_to_markdown(tab, page) -> str:
-    try:
-        grid = [[(page.get_text("text", clip=c).strip() if c else "") for c in r.cells] for r in tab.rows]
-    except Exception:
-        try:
-            grid = [[c or "" for c in r] for r in tab.extract()]
-        except Exception:
-            return ""
-    rows: list[list[str]] = []
-    for r in grid:
-        cells = [[clean(x).strip() for x in c.split("\n") if x.strip()] for c in r]
-        filled = [c for c in cells if c]
-        counts = {len(c) for c in filled}
-        # rows not separated by a rule come out as one row with N lines in every cell: split them
-        if len(filled) >= 2 and len(counts) == 1 and counts.pop() >= 2:
-            n = len(filled[0])
-            for k in range(n):
-                rows.append([c[k] if c else "" for c in cells])
+def grid_table(grid, raw: dict[int, list[Frag]]) -> tuple[str, list[Frag]]:
+    xs, ys = grid
+    used = [f for fs in raw.values() for f in fs
+            if xs[0] - 1 <= (f.x0 + f.x1) / 2 <= xs[-1] + 1 and ys[0] - 1 <= (f.y0 + f.y1) / 2 <= ys[-1] + 1]
+    if not used:
+        return "", []
+
+    def idx(bounds, v):
+        for k in range(len(bounds) - 1):
+            if v <= bounds[k + 1]:
+                return k
+        return len(bounds) - 2
+
+    # cell -> list of text lines (grouped by baseline)
+    cells: dict[tuple[int, int], list[list[Frag]]] = {}
+    for f in sorted(used, key=lambda f: (f.base, f.x0)):
+        key = (idx(ys, (f.y0 + f.y1) / 2), idx(xs, (f.x0 + f.x1) / 2))
+        lines = cells.setdefault(key, [])
+        if lines and abs(lines[-1][0].base - f.base) <= 2.5:
+            lines[-1].append(f)
         else:
-            rows.append([" ".join(c) for c in cells])
-    rows = [[re.sub(r"\s+", " ", c).replace("|", "\\|") for c in r] for r in rows if any(r)]
-    if len(rows) < 2 or max(len(r) for r in rows) < 2:
-        return ""
-    return md_table(rows)
+            lines.append([f])
+
+    def line_text(fr: list[Frag], header: bool) -> str:
+        return " ".join(cell_md(f, header) for f in sorted(fr, key=lambda f: f.x0))
+
+    nrows, ncols = len(ys) - 1, len(xs) - 1
+    rows: list[list[str]] = []
+    for r in range(nrows):
+        cl = [cells.get((r, c), []) for c in range(ncols)]
+        filled = [x for x in cl if x]
+        if not filled:
+            continue
+        counts = {len(x) for x in filled}
+        header = not rows
+        # several unruled rows inside one ruled row: same number of lines in every cell -> split them
+        if len(filled) >= 2 and len(counts) == 1 and next(iter(counts)) >= 2:
+            for k in range(next(iter(counts))):
+                rows.append([line_text(x[k], header and k == 0) if x else "" for x in cl])
+        else:
+            rows.append([join_lines([line_text(ln, header) for ln in x]) for x in cl])
+    if len(rows) < 1 or max(sum(1 for c in r if c) for r in rows) < 2:
+        return "", []
+    return md_table(rows), used
 
 
 def cell_md(f: Frag, header: bool = False) -> str:
-    t = f.text.replace("|", "\\|") if not f.mono else f"`{f.plain}`"
+    t = f.text if not f.mono else "`" + f.plain.replace("|", "\\|") + "`"
     if f.bold and not header and not t.startswith("**"):
         t = f"**{t}**"
     if f.italic and not f.bold and not t.startswith("*"):
@@ -483,10 +634,15 @@ def render_grid(run: list[Line]) -> str:
     if ncols == 2:
         labels = [l.cells[0].plain for l in multi]
         values = [l.cells[1].plain for l in multi]
-        kv = sum(lb.rstrip().endswith(":") for lb in labels) + sum(bool(VALUE_RE.match(v)) for v in values)
+        kv = sum(bool(re.search(r":(\s|$)", lb)) for lb in labels) + sum(bool(VALUE_RE.match(v)) for v in values)
         if kv >= len(multi) * 0.5 or len(multi) == 1:
             items: list[str] = []
             for l in run:
+                if l.multi and all(re.match(r"^[^:]{1,40}:\s*\S", c.plain) for c in l.cells):
+                    for c in l.cells:                         # "Signature: ____   Date: ____"
+                        k, v = c.plain.split(":", 1)
+                        items.append(f"- **{escape_md(k.strip())}:** {escape_md(v.strip())}")
+                    continue
                 if l.multi:
                     label = escape_md(" ".join(c.plain for c in l.cells[:-1]).rstrip().rstrip(":"))
                     items.append(f"- **{label}:** {cell_md(l.cells[-1])}")
@@ -494,9 +650,15 @@ def render_grid(run: list[Line]) -> str:
                     items[-1] += "  \n  " + l.text
             return "\n".join(items)
 
-    # column anchors from the row with the most cells (header preferred on ties)
-    anchor = max(multi, key=lambda l: len(l.cells))
-    cols = [(c.x0, c.x1) for c in anchor.cells]
+    # column ranges from ALL rows: narrow cells first, so a wide cell can't glue two columns together
+    cols: list[list[float]] = []
+    for f in sorted((c for l in multi for c in l.cells), key=lambda c: (c.x1 - c.x0, c.x0)):
+        hits = [k for k in cols if min(k[1], f.x1) - max(k[0], f.x0) > 0]
+        if len(hits) == 1:
+            hits[0][0], hits[0][1] = min(hits[0][0], f.x0), max(hits[0][1], f.x1)
+        elif not hits:
+            cols.append([f.x0, f.x1])
+    cols = [tuple(k) for k in sorted(cols)]
 
     def col_of(f: Frag) -> int:
         best, score = 0, None
@@ -508,6 +670,19 @@ def render_grid(run: list[Line]) -> str:
                 best, score = i, s
         return best
 
+    def split_wide(f: Frag) -> list[tuple[int, str]]:
+        """A cell covering several columns (e.g. tightly spaced header words): split by word position."""
+        hit = [i for i, (a, b) in enumerate(cols) if min(b, f.x1) - max(a, f.x0) > 0]
+        if len(hit) < 2 or not f.words:
+            return [(col_of(f), cell_md(f, header=not rows))]
+        parts: dict[int, list[str]] = {}
+        for wx0, wx1, w in f.words:
+            c = min(hit, key=lambda i: 0 if cols[i][0] - 2 <= (wx0 + wx1) / 2 <= cols[i][1] + 2
+                    else min(abs(cols[i][0] - wx0), abs(cols[i][1] - wx1)))
+            parts.setdefault(c, []).append(w)
+        mark = "**" if f.bold and rows else ""
+        return [(c, mark + escape_md(" ".join(ws)) + mark) for c, ws in parts.items()]
+
     rows: list[list[str]] = []
     for l in run:
         if not l.multi and rows:                              # continuation line: append to its column
@@ -517,8 +692,8 @@ def render_grid(run: list[Line]) -> str:
             continue
         row = [""] * len(cols)
         for f in l.cells:
-            c = col_of(f)
-            row[c] = (row[c] + " " + cell_md(f, header=not rows)).strip()
+            for c, txt in split_wide(f):
+                row[c] = (row[c] + " " + txt).strip()
         rows.append(row)
     return md_table(rows)
 
@@ -531,7 +706,7 @@ def margin_key(text: str) -> str:
 
 
 def find_repeating_lines(pages_blocks, heights) -> set[str]:
-    if len(pages_blocks) < 3:
+    if len(pages_blocks) < 2:
         return set()
     counter: Counter = Counter()
     for blocks, h in zip(pages_blocks, heights):
@@ -546,11 +721,17 @@ def find_repeating_lines(pages_blocks, heights) -> set[str]:
 
 
 def strip_margins(blocks, h, repeating) -> list[Block]:
+    ys = [(l.y0, l.y1) for b in blocks if b.kind == "text" for l in b.lines]
+    if not ys:
+        return blocks
+    top, bottom = min(y[0] for y in ys), max(y[1] for y in ys)
     out = []
     for b in blocks:
         if b.kind == "text":
-            b.lines = [l for l in b.lines if not ((l.y0 < h * 0.08 or l.y1 > h * 0.92)
-                       and (margin_key(l.plain) in repeating or PAGE_NUM_RE.match(l.plain)))]
+            b.lines = [l for l in b.lines if not (
+                ((l.y0 < h * 0.08 or l.y1 > h * 0.92) and margin_key(l.plain) in repeating)
+                or (PAGE_NUM_RE.match(l.plain) and len(b.lines) == 1
+                    and (l.y1 >= bottom - 1 or l.y0 <= top + 1)))]   # lone number at very top/bottom
             if not b.lines:
                 continue
         out.append(b)
@@ -629,7 +810,14 @@ def is_short_line_block(seg: list[Line]) -> bool:
         return False
     avg = sum(len(l.plain) for l in seg) / len(seg)
     widest = max(l.x1 - l.x0 for l in seg)
-    return avg < 45 and widest < 0.5 * seg[0].page_width
+    if avg >= 45 or widest >= 0.5 * seg[0].page_width:
+        return False
+    if len(seg) == 2:
+        return all(len(l.plain) < 40 for l in seg)
+    # wrapped prose: most lines (except the last) run to the same right edge
+    right = max(l.x1 for l in seg)
+    full = sum(1 for l in seg[:-1] if right - l.x1 < 0.04 * widest and len(l.plain) >= 25)
+    return full < 0.6 * (len(seg) - 1)
 
 
 def render(blocks: list[Block], body: float, hmap: dict, page_breaks: bool, title: str | None) -> str:
@@ -647,6 +835,7 @@ def render(blocks: list[Block], body: float, hmap: dict, page_breaks: bool, titl
             stream.append(("seg", seg))
 
     current_page = None
+    last_item = None          # (chunk, marker x0, bottom y, page) of the last list item written
     i = 0
     while i < len(stream):
         kind, obj = stream[i]
@@ -685,7 +874,11 @@ def render(blocks: list[Block], body: float, hmap: dict, page_breaks: bool, titl
                     cat = None if not l.multi else (2 if len(l.cells) == 2 else 3)
                     if l.multi:
                         if ncat and cat != ncat:
-                            ok = False
+                            # a 2-cell first row followed by 3+ cell rows is a header with tight spacing
+                            if ncat == 2 and cat == 3 and len(run) + k == 1 and len(run + s[:k]) == 1:
+                                ncat = 3
+                            else:
+                                ok = False
                         else:
                             ncat = cat
                     else:
@@ -716,12 +909,38 @@ def render(blocks: list[Block], body: float, hmap: dict, page_breaks: bool, titl
             i = max(j, i + 1)
             continue
 
-        md.extend(render_segment(seg, body, hmap))
+        first = seg[0]
+        if last_item and md and md[-1] is last_item[0] and first.page == last_item[3] \
+                and first.x0 > last_item[1] + 3 and 0 <= first.y0 - last_item[2] < 1.5 * first.size \
+                and not (BULLET_RE.match(first.plain) or NUMBERED_RE.match(first.plain) or first.multi):
+            md[-1] = md[-1] + " " + join_lines([l.text for l in seg])     # wrapped list item
+            last_item = (md[-1], last_item[1], seg[-1].y1, first.page)
+            i += 1
+            continue
+        chunks = render_segment(seg, body, hmap)
+        md.extend(chunks)
+        last_item = None
+        if chunks and re.match(r"^(- |\d+\. )", chunks[-1]):
+            item_line = next((l for l in reversed(seg) if BULLET_RE.match(l.plain) or NUMBERED_RE.match(l.plain)), None)
+            if item_line:
+                last_item = (chunks[-1], item_line.x0, seg[-1].y1, first.page)
         i += 1
+
+    # a table continued on the next page under an identical header becomes one table
+    joined: list[str] = []
+    for chunk in (c for c in md if c.strip()):
+        if chunk.startswith("| ") and joined:
+            k = len(joined) - 1
+            while k >= 0 and joined[k].startswith("---\n<!-- Page"):
+                k -= 1
+            if k >= 0 and joined[k].startswith("| ") and joined[k].split("\n", 1)[0] == chunk.split("\n", 1)[0]:
+                joined[k] += "\n" + chunk.split("\n", 2)[2] if chunk.count("\n") >= 2 else ""
+                continue
+        joined.append(chunk)
 
     # tight lists; blank line between different list types
     out: list[str] = []
-    for chunk in (c for c in md if c.strip()):
+    for chunk in joined:
         kind = "ul" if chunk.startswith("- ") else "ol" if re.match(r"^\d+\. ", chunk) else None
         last = out[-1].splitlines()[-1] if out else ""
         pk = "ul" if last.startswith(("- ", "  ")) and out[-1].startswith("- ") else \
@@ -753,9 +972,14 @@ def render_segment(seg: list[Line], body: float, hmap: dict) -> list[str]:
             out.append("```\n" + "\n".join(code) + "\n```"); code = []
 
     head_buf, head_lvl = [], 0
-    for l in seg:
-        if l.mono:
+    for n, l in enumerate(seg):
+        lone_mono = l.mono and not (n > 0 and seg[n - 1].mono) and not (n + 1 < len(seg) and seg[n + 1].mono)
+        if l.mono and not lone_mono:
             flush(); code.append(l.plain); continue
+        if lone_mono:                                   # a single monospace line reads better inline
+            flush_code()
+            para.append(f"`{l.plain}`")
+            continue
         flush_code()
         lvl = heading_level(l, body, hmap, len(seg))
         if lvl:
