@@ -721,7 +721,7 @@ def join_wrapped(a: str, b: str) -> str:
     if not a:
         return b
     if re.search(r"[A-Za-z]-$", a) and b[:1].isalpha():
-        return a[:-1] + b                       # Chai- + tanya -> Chaitanya
+        return a[:-1] + b                       # Ali- + son -> Alison
     if re.search(r"[\d,.]$", a) and b[:1].isdigit():
         return a + b                            # $12,49 + 6.00 -> $12,496.00
     return a + " " + b
