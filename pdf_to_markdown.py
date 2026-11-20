@@ -684,18 +684,47 @@ def render_grid(run: list[Line]) -> str:
         return [(c, mark + escape_md(" ".join(ws)) + mark) for c, ws in parts.items()]
 
     rows: list[list[str]] = []
+    prev: Line | None = None
+    prev_filled = 0
+    parent_gap = None          # space above the last real row
     for l in run:
-        if not l.multi and rows:                              # continuation line: append to its column
-            c = col_of(l.cells[0])
-            sep = " - " if (l.cells[0].italic or l.cells[0].size < l.size + 0.01 and l.cells[0].italic) else " "
-            rows[-1][c] = (rows[-1][c] + sep + cell_md(l.cells[0])).strip()
+        # text wrapped inside its cells: much closer to the row above than that row is to the one
+        # before it (dense tables with uniform spacing never merge), and fills few columns
+        gap = l.y0 - prev.y1 if prev is not None else None
+        wrapped = prev is not None and rows and gap < 0.25 * l.size \
+            and parent_gap is not None and gap < parent_gap - 0.3 * l.size \
+            and len(l.cells) <= max(1, prev_filled // 2)
+        if wrapped or (not l.multi and rows):
+            for f in l.cells:
+                c = col_of(f)
+                if wrapped and not f.italic:
+                    rows[-1][c] = join_wrapped(rows[-1][c], cell_md(f))
+                elif wrapped:
+                    rows[-1][c] = (rows[-1][c] + " - " + cell_md(f)).strip()
+                else:
+                    sep = " - " if f.italic else " "
+                    rows[-1][c] = (rows[-1][c] + sep + cell_md(f)).strip()
+            prev = l
             continue
         row = [""] * len(cols)
         for f in l.cells:
             for c, txt in split_wide(f):
                 row[c] = (row[c] + " " + txt).strip()
         rows.append(row)
+        parent_gap = gap
+        prev, prev_filled = l, sum(1 for x in row if x)
     return md_table(rows)
+
+
+def join_wrapped(a: str, b: str) -> str:
+    """Re-join a cell value that the PDF wrapped onto the next line."""
+    if not a:
+        return b
+    if re.search(r"[A-Za-z]-$", a) and b[:1].isalpha():
+        return a[:-1] + b                       # Chai- + tanya -> Chaitanya
+    if re.search(r"[\d,.]$", a) and b[:1].isdigit():
+        return a + b                            # $12,49 + 6.00 -> $12,496.00
+    return a + " " + b
 
 
 # --------------------------------------------------------------------------- #
@@ -877,6 +906,9 @@ def render(blocks: list[Block], body: float, hmap: dict, page_breaks: bool, titl
                             # a 2-cell first row followed by 3+ cell rows is a header with tight spacing
                             if ncat == 2 and cat == 3 and len(run) + k == 1 and len(run + s[:k]) == 1:
                                 ncat = 3
+                            elif ncat == 3 and cat == 2 and prev_any is not None \
+                                    and l.y0 - prev_any.y1 < 0.25 * l.size:
+                                pass          # cells of the row above wrapped onto this line
                             else:
                                 ok = False
                         else:
@@ -885,8 +917,11 @@ def render(blocks: list[Block], body: float, hmap: dict, page_breaks: bool, titl
                         # single cell continues the row only if it sits inside the grid, close below it
                         last = prev_line
                         above = prev_any
-                        if not last or l.y0 - above.y1 > 1.2 * l.size or l.x0 <= last.x0 + 5:
+                        tight = above is not None and l.y0 - above.y1 < 0.25 * l.size
+                        if not last or l.y0 - above.y1 > 1.2 * l.size or (l.x0 <= last.x0 + 5 and not tight):
                             ok = False
+                        elif tight and any(abs(l.x0 - c.x0) <= 6 for c in last.cells):
+                            pass                                  # wrapped text inside a column
                         elif not any(abs(l.x0 - c.x0) <= 6 or c.x0 <= l.x0 <= c.x1 for c in last.cells[1:]):
                             ok = False
                     if not ok:
